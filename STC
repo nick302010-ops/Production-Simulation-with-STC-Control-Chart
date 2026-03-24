@@ -1,0 +1,355 @@
+!pip install simpy
+
+import simpy
+import numpy as np
+import matplotlib.pyplot as plt
+import pandas as pd
+from openpyxl import Workbook
+from openpyxl.utils.dataframe import dataframe_to_rows
+from openpyxl.chart import LineChart, Reference
+
+# -------------------------------
+# STC Control Line Calculation Function
+# -------------------------------
+def calculate_x(t, mu, Q, R, sigma, z_alpha):
+    """
+    Calculate the control line:
+      x = -((mu - Q) * (R - t) / R) - z_alpha * sigma * sqrt((R - t)/R)
+    """
+    return -((mu - Q) * (R - t) / R) - z_alpha * sigma * np.sqrt((R - t) / R)
+
+# -------------------------------
+# STC Control Line Tool
+# -------------------------------
+def stc_control_lines(t_vals, mu, Q, R, sigma, z_vals):
+    lines = {}
+    for z in z_vals:
+        lines[z] = [calculate_x(t, mu, Q, R, sigma, z) for t in t_vals]
+    return lines
+
+# -------------------------------
+# Plot STC Chart Function (with annotation)
+# -------------------------------
+def plot_stc_chart(record, target, R, mu, sigma, title="STC Chart", annotation=""):
+    """
+    Plot the STC chart:
+      - Planned production: target * (t/R)
+      - Production difference: actual - planned
+      - Multiple control lines are overlayed
+      - An optional annotation is added on the top-left corner
+    """
+    times = [t for (t, prod) in record]
+    actual = [prod for (t, prod) in record]
+    planned = [target * (t / R) for t in times]
+    diff = [a - p for a, p in zip(actual, planned)]
+
+    t_vals = np.linspace(0, R, 100)
+    z_vals = [-1.675, -0.674, 0, 0.674, 1.675]
+    control = stc_control_lines(t_vals, mu, target, R, sigma, z_vals)
+
+    plt.figure(figsize=(10, 6))
+    for z in z_vals:
+        plt.plot(t_vals, control[z], label=f"Control (z={z})")
+    plt.plot(times, diff, 'k--', lw=2, label="Production Difference")
+    plt.xlabel("Time (hours)")
+    plt.ylabel("Difference (units)")
+    plt.title(title)
+    plt.legend()
+    plt.grid(True)
+
+    # Add annotation text if provided
+    if annotation:
+        plt.gca().text(0.02, 0.98, annotation, transform=plt.gca().transAxes,
+                       fontsize=10, verticalalignment='top',
+                       bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5))
+
+    plt.show()
+
+# -------------------------------
+# Discrete Simulation: Add Manpower Strategy
+# -------------------------------
+def production_process_manpower_discrete(env, R, quota, initial_workers, T_add, additional_workers, prod_mean, prod_variance, time_intervals, record, result, verbose=False):
+    dt = R / time_intervals
+    mean_dt = prod_mean * dt
+    std_dt = np.sqrt(prod_variance * dt)
+    cumulative_production = 0.0
+    finish_time = None
+    worker_count = initial_workers
+    record.append((env.now, cumulative_production))
+    for i in range(time_intervals):
+        yield env.timeout(dt)
+        t = env.now
+        # At T_add, add additional workers (only once)
+        if t >= T_add and worker_count == initial_workers:
+            worker_count += additional_workers
+            if verbose:
+                print(f"At time {t:.2f} hrs: Added {additional_workers} workers; total now {worker_count}")
+        if cumulative_production < quota:
+            raw_samples = np.random.normal(mean_dt, std_dt, size=worker_count)
+            samples = np.maximum(raw_samples, 0)
+            production_dt = np.sum(samples)
+            # If production in this interval exceeds quota, interpolate to get the exact finish time
+            if cumulative_production + production_dt >= quota:
+                fraction = (quota - cumulative_production) / production_dt
+                finish_time = t - dt + fraction * dt
+                production_dt = quota - cumulative_production
+                cumulative_production += production_dt
+                record.append((finish_time, cumulative_production))
+                if verbose:
+                    print(f"[Completed] at {finish_time:.2f} hrs, cumulative production: {cumulative_production:.2f}")
+                break
+            else:
+                cumulative_production += production_dt
+                record.append((t, cumulative_production))
+    result["finish_time"] = finish_time
+    result["cumulative_production"] = cumulative_production
+
+# -------------------------------
+# Discrete Simulation: Overtime Strategy
+# -------------------------------
+def production_process_overtime_discrete(env, R, quota, n_worker, prod_mean, prod_variance, time_intervals, record, result, verbose=False):
+    dt = R / time_intervals
+    mean_dt = prod_mean * dt
+    std_dt = np.sqrt(prod_variance * dt)
+    cumulative_production = 0.0
+    finish_time = None
+    record.append((env.now, cumulative_production))
+    for i in range(time_intervals):
+        yield env.timeout(dt)
+        t = env.now
+        if cumulative_production < quota:
+            raw_samples = np.random.normal(mean_dt, std_dt, size=n_worker)
+            samples = np.maximum(raw_samples, 0)
+            production_dt = np.sum(samples)
+            if cumulative_production + production_dt >= quota:
+                fraction = (quota - cumulative_production) / production_dt
+                finish_time = t - dt + fraction * dt
+                production_dt = quota - cumulative_production
+                cumulative_production += production_dt
+                record.append((finish_time, cumulative_production))
+                if verbose:
+                    print(f"[Completed] at {finish_time:.2f} hrs, cumulative production: {cumulative_production:.2f}")
+                break
+            else:
+                cumulative_production += production_dt
+                record.append((t, cumulative_production))
+    result["finish_time"] = finish_time
+    result["cumulative_production"] = cumulative_production
+
+# -------------------------------
+# Simulation Execution Functions
+# -------------------------------
+def run_simulation_manpower_discrete(R, quota, initial_workers, T_add, additional_workers, prod_mean, prod_variance, time_intervals, verbose=False):
+    env = simpy.Environment()
+    record = []
+    result = {}
+    env.process(production_process_manpower_discrete(env, R, quota, initial_workers, T_add, additional_workers, prod_mean, prod_variance, time_intervals, record, result, verbose))
+    env.run()
+    finish_time = result.get("finish_time", None)
+    cumulative_production = result.get("cumulative_production", 0)
+    return record, finish_time, cumulative_production
+
+def run_simulation_overtime_discrete(R, quota, n_worker, prod_mean, prod_variance, time_intervals, verbose=False):
+    env = simpy.Environment()
+    record = []
+    result = {}
+    env.process(production_process_overtime_discrete(env, R, quota, n_worker, prod_mean, prod_variance, time_intervals, record, result, verbose))
+    env.run()
+    finish_time = result.get("finish_time", None)
+    cumulative_production = result.get("cumulative_production", 0)
+    return record, finish_time, cumulative_production
+
+# -------------------------------
+# Helper Function: Production at Time R
+# -------------------------------
+def get_production_at_R(record, R):
+    """
+    Retrieve the last production data point within time <= R; return 0 if none.
+    """
+    prod_at_R = 0.0
+    for t, prod in record:
+        if t <= R:
+            prod_at_R = prod
+        else:
+            break
+    return prod_at_R
+
+# -------------------------------
+# Estimate Completion Time (if not achieved within simulation)
+# -------------------------------
+def estimate_finish_time(record, R, quota):
+    """
+    Estimate total time to reach quota, assuming constant production rate based on production within R hours.
+    """
+    production_at_R = get_production_at_R(record, R)
+    if production_at_R <= 0:
+        return None
+    extra_time = R * (quota - production_at_R) / production_at_R
+    return R + extra_time
+
+# -------------------------------
+# Updated Manpower Strategy Cost Calculation Function
+# -------------------------------
+def calculate_costs_manpower(T_finish, T_add, additional_workers, n_worker, wage, R):
+    """
+    Manpower strategy cost:
+      - Initial workers cost: if T_finish <= R, cost = n_worker * wage * T_finish;
+        if T_finish > R, then first R hours at normal wage, remaining at 1.5 * wage.
+      - Additional workers cost: only if T_finish > T_add, working period from T_add to T_finish is considered:
+          Normal hours: from T_add to min(T_finish, R)
+          Overtime hours: from R to T_finish (if applicable) at 1.5 * wage.
+    """
+    if T_finish <= R:
+        cost_initial = n_worker * wage * T_finish
+    else:
+        cost_initial = n_worker * (wage * R + wage * 1.5 * (T_finish - R))
+
+    if T_finish <= T_add:
+        cost_additional = 0
+    else:
+        normal_hours = min(T_finish, R) - T_add
+        overtime_hours = max(0, T_finish - R)
+        cost_additional = additional_workers * (wage * normal_hours + wage * 1.5 * overtime_hours)
+
+    return cost_initial + cost_additional
+
+# -------------------------------
+# Overtime Strategy Cost Calculation Function
+# -------------------------------
+def calculate_costs_overtime(T_finish, R, n_worker, wage):
+    """
+    Overtime strategy cost:
+      - If T_finish <= R: cost = n_worker * wage * T_finish
+      - If T_finish > R: cost = n_worker * wage * R + n_worker * wage * 1.5 * (T_finish - R)
+    """
+    if T_finish <= R:
+        return n_worker * wage * T_finish
+    else:
+        return n_worker * wage * R + n_worker * wage * 1.5 * (T_finish - R)
+
+# -------------------------------
+# Multiple Simulation Statistics: Y_Completion and Y_Production_Ratio
+# -------------------------------
+def simulate_target_probability_discrete(simulation_func, R, quota, *args, time_intervals=100, iterations=1000, verbose=False):
+    success_count = 0
+    production_ratios = []
+    last_record = None
+    for i in range(iterations):
+        np.random.seed(123 + i)
+        record, finish_time, cumulative_production = simulation_func(R, quota, *args, time_intervals, verbose)
+        if finish_time is not None and finish_time <= R:
+            success_count += 1
+        production_ratios.append(cumulative_production / quota * 100)
+        last_record = record
+    return success_count / iterations, np.mean(production_ratios), last_record
+
+# -------------------------------
+# Main Program: Simulation, Cost Calculation and STC Chart Plotting
+# -------------------------------
+if __name__ == "__main__":
+    # Fixed parameter settings
+    R = 9.8                 # Total simulation period (hours)
+    quota = 27541         # Production target (Quota)
+    prod_mean = 235         # Average production per worker per hour
+    prod_variance = 11      # Production variance per worker per hour
+    time_intervals = 100    # Number of discrete time intervals
+    wage = 20.0             # Wage per worker per hour (USD)
+
+    # STC chart parameters
+    mu_param = 27541        # μ in control line calculation
+    sigma_param = 980       # σ in control line calculation
+
+    # Strategy parameters
+    # Manpower strategy
+    initial_workers = 11
+    T_add = 2.4             # Time to add workers
+    additional_workers = 2  # Number of additional workers
+    # Overtime strategy (fixed number of workers)
+    n_worker = 11
+
+    # -------------------------------
+    # 1000 Simulation Runs Statistics
+    # -------------------------------
+    y_completion_manpower_multi, y_production_ratio_manpower_multi, _ = simulate_target_probability_discrete(
+        run_simulation_manpower_discrete, R, quota, initial_workers, T_add, additional_workers, prod_mean, prod_variance,
+        time_intervals=time_intervals, iterations=1000, verbose=False
+    )
+    y_completion_overtime_multi, y_production_ratio_overtime_multi, _ = simulate_target_probability_discrete(
+        run_simulation_overtime_discrete, R, quota, n_worker, prod_mean, prod_variance,
+        time_intervals=time_intervals, iterations=1000, verbose=False
+    )
+    print("=== Multiple Simulation Results (1000 Runs) ===")
+    print("Manpower Strategy: Y_Completion: {:.2%}, Y_Production_Ratio: {:.2f}%".format(
+        y_completion_manpower_multi, y_production_ratio_manpower_multi))
+    print("Overtime Strategy: Y_Completion: {:.2%}, Y_Production_Ratio: {:.2f}%".format(
+        y_completion_overtime_multi, y_production_ratio_overtime_multi))
+
+    # -------------------------------
+    # Single Simulation Comparison: using same random seed
+    # -------------------------------
+    np.random.seed(42)
+    state = np.random.get_state()  # Save current random state
+    record_manpower_single, T_finish_manpower, cumulative_manpower = run_simulation_manpower_discrete(
+        R, quota, initial_workers, T_add, additional_workers, prod_mean, prod_variance, time_intervals, verbose=False
+    )
+    np.random.set_state(state)  # Restore state for overtime simulation
+    record_overtime_single, T_finish_overtime, cumulative_overtime = run_simulation_overtime_discrete(
+        R, quota, n_worker, prod_mean, prod_variance, time_intervals, verbose=False
+    )
+
+    # Cost calculation for manpower strategy
+    if T_finish_manpower is None:
+        T_finish_manpower_est = estimate_finish_time(record_manpower_single, R, quota)
+        print("\nManpower Strategy did not complete within simulation; Estimated completion time: {:.2f} hrs".format(T_finish_manpower_est))
+        cost_manpower = calculate_costs_manpower(T_finish_manpower_est, T_add, additional_workers, initial_workers, wage, R)
+    else:
+        cost_manpower = calculate_costs_manpower(T_finish_manpower, T_add, additional_workers, initial_workers, wage, R)
+
+    # Cost calculation for overtime strategy
+    if T_finish_overtime is None:
+        T_finish_overtime_est = estimate_finish_time(record_overtime_single, R, quota)
+        print("\nOvertime Strategy did not complete within simulation; Estimated completion time: {:.2f} hrs".format(T_finish_overtime_est))
+        cost_overtime = calculate_costs_overtime(T_finish_overtime_est, R, n_worker, wage)
+    else:
+        cost_overtime = calculate_costs_overtime(T_finish_overtime, R, n_worker, wage)
+
+    print("\n=== Single Simulation Cost Comparison (Same Random Seed) ===")
+    # Manpower strategy cost info and annotation text generation
+    if T_finish_manpower is not None and T_finish_manpower <= R:
+        manpower_info = f"Completion Time: {T_finish_manpower:.2f} hrs\nCost: ${cost_manpower:.2f}"
+        print(f"Manpower Strategy: {manpower_info}")
+    else:
+        production_at_R_man = get_production_at_R(record_manpower_single, R)
+        remaining_manpower = quota - production_at_R_man
+        extra_time_manpower = (T_finish_manpower_est - R) if T_finish_manpower is None else (T_finish_manpower - R)
+        manpower_info = (f"Production at R={R} hrs: {production_at_R_man:.2f} units\n"
+                         f"Shortfall: {remaining_manpower:.2f} units\n"
+                         f"Estimated Additional Time: {extra_time_manpower:.2f} hrs\n"
+                         f"Estimated Cost: ${cost_manpower:.2f}")
+        print("Manpower Strategy:")
+        print(manpower_info)
+
+    # Overtime strategy cost info and annotation text generation
+    if T_finish_overtime is not None and T_finish_overtime <= R:
+        overtime_info = f"Completion Time: {T_finish_overtime:.2f} hrs\nCost: ${cost_overtime:.2f}"
+        print(f"Overtime Strategy: {overtime_info}")
+    else:
+        production_at_R_ovt = get_production_at_R(record_overtime_single, R)
+        remaining_overtime = quota - production_at_R_ovt
+        extra_time_overtime = (T_finish_overtime_est - R) if T_finish_overtime is None else (T_finish_overtime - R)
+        overtime_info = (f"Production at R={R} hrs: {production_at_R_ovt:.2f} units\n"
+                         f"Shortfall: {remaining_overtime:.2f} units\n"
+                         f"Estimated Additional Time: {extra_time_overtime:.2f} hrs\n"
+                         f"Estimated Cost: ${cost_overtime:.2f}")
+        print("Overtime Strategy:")
+        print(overtime_info)
+
+    # Use the generated simulation result strings as annotations for the STC charts
+    manpower_annotation = manpower_info
+    overtime_annotation = overtime_info
+
+    # Plot STC charts with dynamic annotations
+    plot_stc_chart(record_manpower_single, quota, R, mu_param, sigma_param,
+                   title="STC Chart - Manpower Strategy", annotation=manpower_annotation)
+    plot_stc_chart(record_overtime_single, quota, R, mu_param, sigma_param,
+                   title="STC Chart - Overtime Strategy", annotation=overtime_annotation)
